@@ -7,6 +7,9 @@ use File::Spec;
 #alarm 86400;
 $|=1;
 
+# finish sudo session when done
+END { print "Logout\n"; system "sudo -K"; }
+
 our %clients;
 our %pattern_config;
 our @logs;
@@ -23,16 +26,25 @@ Where options are
 	--watch <type>:<file>	watch defined file with patterns according to <type>
 
 Watches log files for modifications, parses new entries to find patterns to find attackers and bots.
-Each pattern defines a score which is summed up per IP. If an IP gets more that 100 score points
+Each pattern defines a score which is summed up per IP. If an IP gets more than 100 score points
 it is blocked via an iptables rule.
-Score points decay by 1% per 30 seconds since the last occurrence (matching rules or not). Blocked
+Score points decay by 1 per minute since the last occurrence (matching rules or not). Blocked
 IPs are checked by occurrence in iptables rules as they cannot occur in log files anymore. Once a
 blocked IP has less then 10 score points it is unblocked again.
 So for example if an attacker sends two attack requests each scored with 80 points, he get's 160
 total score points and is blocked. With no incoming packets from this IP it will take
-	ln(10/160) / ln(0.99) = 275.87
-cycles of 30 seconds, so 2:17 hours. Common attack patterns should score quite a bit less than 100,
+	160 - 10 = 150
+minutes, so 2:30 hours. Common attack patterns should score quite a bit less than 100,
 like e.g. 80 points so that real users are not blocked accidentally.
+Definite patterns may be scored > 100 points so that the attacker is immediately blocked.
+Common patterns are scored negative so that the user e.g. gets 10 score points for calling a login
+page. It works so he starts using the application and normal usage scores -1 per page so that he quickly
+proves he's a good guy.
+This way users may get negative scores and they're also decayed by 1 per minute so that a user with
+e.g. -30 points takes 30 minutes to be neutral again and thus removed from the clients table.
+You should pay attention not to score common pages too easily so that an attacker cannot scan for logins
+while proving he's harmles by hammering /index.htm.
+Maybe you do not want to decrease score that way at all. (To be investigated.)
 ";
 }
 
@@ -49,7 +61,7 @@ GetOptions(
 if ($< != 0) {
 	# try to authenticate and call iptables for testing
 	# TODO: maybe try all iptables commands we use?
-	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ts to call iptables: ' $iptables_cmd -nL > /dev/null";
+	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ".(getpwuid($<))[0]." to call iptables: ' $iptables_cmd -nL > /dev/null";
 	# that's how we use iptables now: sudo with no prompt
 	$iptables_cmd = "sudo -n $iptables_cmd";
 	# keep sudo timestamp up to date
@@ -58,8 +70,6 @@ if ($< != 0) {
 		alarm 1;
 	};
 	alarm 1;
-	# when done, log out
-	END { system "sudo -K"; }
 }
 
 sub max {
@@ -130,7 +140,10 @@ sub read_pattern_config {
 	\%conf;
 }
 sub reread_config {
-	$pattern_config{$_} = read_pattern_config $_ foreach keys %pattern_config;
+	my @types = keys %pattern_config;
+	foreach my $type (@types) {
+		$pattern_config{$type} = read_pattern_config($type);
+	}
 }
 my $SIGHUP=0;
 $SIG{HUP} = sub {
@@ -182,7 +195,15 @@ sub parse_log($) {
 sub effective_score {
 	my $client = shift;
 	my $time = shift;
-	$client->{score} * (0.99**max(0,($time-$client->{last_seen})/30));
+	my $decay = ($time-$client->{last_seen})/60;
+
+	$client->{score} > 0
+		? $client->{score} > $decay
+			? $client->{score}-$decay
+			: 0
+		: $client->{score} < -$decay
+			? $client->{score}+$decay
+			: 0
 }
 sub get_filter {
 	my %filter;
@@ -214,11 +235,11 @@ sub update_rules {
 	my @deny;
 	my @allow;
 	foreach my $client (values %clients) {
-		# if packets have been block, we saw him:
+		# if packets have been blocked, we saw him:
 		$client->{last_seen} = $time if (($filter->{$client->{ip}})//{})->{pkts};
 
-		# if not forget him after 6 hours (at most)
-		if ($client->{last_seen} < ($time-6*3600)) {
+		# if not forget him after 24 hours (at most)
+		if ($client->{last_seen} < ($time-24*3600)) {
 			delete $clients{$client->{ip}};
 			next;
 		}
@@ -226,8 +247,8 @@ sub update_rules {
 		# effective score with decay
 		my $score = effective_score($client,$time);
 
-		# also forget those which are neutral (has score 0.9 about 5 min after score 1)
-		delete $clients{$client->{ip}} if abs($score) < 0.9;
+		# also forget those which are neutral
+		delete $clients{$client->{ip}} if $score == 0;
 
 		# now deny the bad guys
 		push @deny, $client->{ip} if $score > 100 && !defined $filter->{$client->{ip}};
