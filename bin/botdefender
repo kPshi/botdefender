@@ -1,0 +1,326 @@
+#!/usr/bin/perl -w
+use strict;
+#use Carp;
+use Date::Parse;
+use Getopt::Long;
+use File::Spec;
+#alarm 86400;
+$|=1;
+
+our %clients;
+our %pattern_config;
+our @logs;
+our $iptables_cmd = "iptables";
+# check parameters
+sub syntax {
+	my ($me) = $0=~m,([^/]+)$,;
+	die "Syntax: $me <options>
+Where options are
+	--help			show this help
+	--base <dir>		base directory to check for pattern definitions
+	--list			list all known pattern definition types (like apache-access, auth,
+				exim4, ...)
+	--watch <type>:<file>	watch defined file with patterns according to <type>
+
+Watches log files for modifications, parses new entries to find patterns to find attackers and bots.
+Each pattern defines a score which is summed up per IP. If an IP gets more that 100 score points
+it is blocked via an iptables rule.
+Score points decay by 1% per 30 seconds since the last occurrence (matching rules or not). Blocked
+IPs are checked by occurrence in iptables rules as they cannot occur in log files anymore. Once a
+blocked IP has less then 10 score points it is unblocked again.
+So for example if an attacker sends two attack requests each scored with 80 points, he get's 160
+total score points and is blocked. With no incoming packets from this IP it will take
+	ln(10/160) / ln(0.99) = 275.87
+cycles of 30 seconds, so 2:17 hours. Common attack patterns should score quite a bit less than 100,
+like e.g. 80 points so that real users are not blocked accidentally.
+";
+}
+
+syntax unless @ARGV;
+my ($base,$list,$help,@watch) = File::Spec->rel2abs(($0=~m,(.*)/,)[0])."/../conf";
+GetOptions(
+	"help", \$help,
+	"base=s", \$base,
+	"list", \$list,
+	"watch=s", \@watch,
+);
+
+# not root? have to prepare using sudo
+if ($< != 0) {
+	# try to authenticate and call iptables for testing
+	# TODO: maybe try all iptables commands we use?
+	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ts to call iptables: ' $iptables_cmd -nL > /dev/null";
+	# that's how we use iptables now: sudo with no prompt
+	$iptables_cmd = "sudo -n $iptables_cmd";
+	# keep sudo timestamp up to date
+	$SIG{ALRM} = sub {
+		system "sudo -v";
+		alarm 1;
+	};
+	alarm 1;
+	# when done, log out
+	END { system "sudo -K"; }
+}
+
+sub max {
+	my $max;
+	foreach (@_) {
+		next unless defined;
+		$max = $_ unless defined $max && $max > $_;
+	}
+	$max;
+}
+sub parse_val {
+	my $val = shift;
+	if ($val =~ /^m(.)(.+?)\1([a-z]*)$/ or $val =~ m,^(/)(.+?)\1([a-z]*)$,) {
+		$val = qr/$2/ or die $@;
+		# add modifiers
+		if ($3) {
+			$val = "(?$3:$val)";
+			$val = qr/$val/;
+		}
+	} elsif ($val =~ /^(-?\d+)$/ || $val =~ /^"((?:\\"|[^"])*)"$/ or $val =~ /^'((?:\\'|[^'])*)'$/) {
+		$val = $1;
+		$val =~ s/\\(.)/$1/g;
+	} else {
+		die "Invalid value: $val";
+	}
+	$val;
+}
+
+sub read_pattern_config {
+	my $type = shift;
+	my $file = "$base/$type.conf";
+	open(my $fh,"<",$file) or die $!;
+	my %conf = (
+		var => {},
+		match => [],
+		file => $file,
+	);
+	@conf{"size","mtime"} = (stat $fh)[7,9];
+	my $section;
+	my %flags;
+	while (<$fh>) {
+		next if /^\s*$/;
+		next if /^\s*#/;
+		s/^\s+|\s+$//g;
+		if (/^\[\s*([^:\]]+?)(?::([^\]]+))?]\s*$/) {
+			$section = lc $1;
+			%flags = defined $2 ? map {($_,1)} $2=~/([^,]+)/g : ();
+			next;
+		}
+		if ($section eq "var") {
+			if (/^\s*(\w+)\s*=\s*(.+)\s*$/) {
+				my $var = $1;
+				my $val = parse_val $2;
+				die "Invalid value $2" unless defined $val;
+				$conf{var}->{$var} = $val;
+				next;
+			}
+			die "$@ in $file line $.";
+		} elsif ($section =~ /^(-?\d+)$/) {
+			my $re = parse_val $_;
+			if (ref($re) eq "Regexp") {
+				push @{$conf{match}}, {re => $re, score => $section, flags => \%flags};
+				next;
+			}
+			die "Not a RegEx: $_";
+		}
+	}
+	\%conf;
+}
+sub reread_config {
+	$pattern_config{$_} = read_pattern_config $_ foreach keys %pattern_config;
+}
+my $SIGHUP=0;
+$SIG{HUP} = sub {
+	$SIGHUP=1;
+};
+
+# there is some new data in this file handle
+sub parse_log($) {
+	my $log = shift;
+	my $fh = $log->{fh};
+	my $conf = $pattern_config{$log->{type}};
+	while (my $line = <$fh>) {
+		my %var;
+		foreach my $var (keys %{$conf->{var}}) {
+			my $val = $conf->{var}->{$var};
+			if (ref($val) eq 'Regexp') {
+				if (my @vals = grep {defined} $line =~ /$val/) {
+					$var{$var} = join " ",@vals;
+				} else {
+					$var{$var} = undef;
+				}
+			} else {
+				$var{$var} = $val;
+			}
+		}
+		defined $var{ip} or next;
+		my $t = str2time $var{time};
+		$t //= $log->{parse}->{time};
+		$t //= time();
+		$log->{parse}->{time} = $t;
+
+		my $client = $clients{$var{ip}};
+		if (! defined $client) {
+			$client = { score => 0, ip => $var{ip}, last_seen => $t };
+			$clients{$var{ip}} = $client;
+		}
+		# decay over time
+		$client->{score} = effective_score($client, $t);
+		$client->{last_seen} = $t;
+		
+		# check patterns
+		foreach my $match (@{$conf->{match}}) {
+			next unless $line =~ /$match->{re}/;
+			$client->{score}+=$match->{score};
+			last;
+		}
+	}
+}
+sub effective_score {
+	my $client = shift;
+	my $time = shift;
+	$client->{score} * (0.99**max(0,($time-$client->{last_seen})/30));
+}
+sub get_filter {
+	my %filter;
+	my @fields;
+	foreach (`$iptables_cmd --line-numbers -nvL botdefender -Z`) {
+		print;
+		next if /^Chain /;
+		next if /^Zeroing /;
+		if (@fields) {
+			my @v = /(\S+)/g;
+			my $entry;
+			foreach my $i (0..$#fields) {
+				$entry->{$fields[$i]} = $v[$i];
+			}
+			# put into lookup-map
+			$filter{$entry->{source}} = $entry;
+		} else {
+			@fields = /(\w+)/g;
+		}
+	}
+	\%filter;
+}
+
+sub update_rules {
+	my $time = time();
+	my $line=0;
+	my $filter = get_filter();
+
+	my @deny;
+	my @allow;
+	foreach my $client (values %clients) {
+		# if packets have been block, we saw him:
+		$client->{last_seen} = $time if (($filter->{$client->{ip}})//{})->{pkts};
+
+		# if not forget him after 6 hours (at most)
+		if ($client->{last_seen} < ($time-6*3600)) {
+			delete $clients{$client->{ip}};
+			next;
+		}
+
+		# effective score with decay
+		my $score = effective_score($client,$time);
+
+		# also forget those which are neutral (has score 0.9 about 5 min after score 1)
+		delete $clients{$client->{ip}} if abs($score) < 0.9;
+
+		# now deny the bad guys
+		push @deny, $client->{ip} if $score > 100 && !defined $filter->{$client->{ip}};
+		# and allow those who behave now
+		push @allow, $client->{ip} if $score < 10 && defined $filter->{$client->{ip}};
+	}
+
+	# allow those which we don't know anymore
+	push @allow,grep {!exists($clients{$_})} keys %$filter;
+
+	print localtime()." - clients:\n";
+	print "\t$_->{ip} : ".effective_score($_,$time)."\n" foreach sort {effective_score($a,$time) <=> effective_score($b,$time)} values %clients;
+	print "Allow @allow\n" if @allow;
+	@allow = sort { $a->{num} <=> $b->{num} } map { $filter->{$_} } @allow;
+	for (my $i = 0 ; $i < @allow ; ++$i) {
+		system $iptables_cmd,"-D","botdefender",($allow[$i]->{num}-$i);
+	}
+	print "Deny @deny\n" if @deny;
+	system $iptables_cmd,"-I","botdefender","--source",$_,"-j","banned" foreach @deny;
+	#system "$iptables_cmd -nvL botdefender";
+}
+
+syntax if $help;
+# scan log(s)
+foreach (@ARGV) {eval {
+	my ($type,$log) = /^(.+?):(.+)$/;
+	die "Not a valid type:file combination: $_" unless defined $type;
+	if (! defined($pattern_config{$type}//=read_pattern_config($type))) {
+		die "Unknown type name: $type";
+		
+	}
+	die "File not found: $_" unless -e $log;
+	die "Not a regular file: $_" unless -f $log;
+	die "Cannot read file: $_" unless -r $log;
+
+	$log = {
+		file => $log,
+		mtime => 0,
+		size => 0,
+		type => $type,
+	};
+
+	open($log->{fh},"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
+	push @logs,$log;
+	
+}}
+sub equal($$) {
+	return 1 unless defined $_[0];
+	return 1 unless defined $_[1];
+	$_[0] eq $_[1];
+}
+
+my $rtime = time();
+while (1) {
+	my $mod = 0;
+	foreach my $log (@logs) {eval {
+		my @sf = stat($log->{file});
+		my @sh = stat($log->{fh});
+
+		# file was re-created
+		if (!equal $sh[1], $sf[1]) {
+			# finish old
+			parse_log $log;
+			close ($log->{fh});
+
+			# open new
+			open($log->{fh} ,"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
+			$log->{mtime} = 0;
+			$log->{size} = 0;
+			@sh = @sf;
+			$mod=1;
+		} 
+
+		# some changes?
+		if (!equal($sh[7], $log->{mtime}) || !equal($sh[9], $log->{size})) {
+			parse_log $log;
+			$log->{mtime} = $sh[7];
+			$log->{size} = $sh[9];
+			$mod=1;
+		}
+	}}
+
+	# update banned ips
+	if ($mod || (time > $rtime+30)) {
+		update_rules();
+		$rtime = time;
+	}
+
+	# wait a while
+	select undef,undef,undef,.1;
+	if ($SIGHUP) {
+		reread_config();
+		$SIGHUP=0;
+	}
+}
+
