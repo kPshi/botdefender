@@ -196,11 +196,17 @@ sub parse_log($) {
 		$client->{last_seen} = $t;
 		
 		# check patterns
+		my $score = 0;
 		foreach my $match (@{$conf->{match}}) {
 			next unless $line =~ /$match->{re}/;
-			$client->{score}+=$match->{score};
+			$score=$match->{score};
 			last;
 		}
+		$client->{score}=effective_score($client,$t) + $score;
+
+		# enable for debug:
+		#push @{$client->{lines}},{score => $score, line => $line};
+		#shift @{$client->{lines}} while @{$client->{lines}} > 10;
 	}
 }
 sub effective_score {
@@ -259,7 +265,10 @@ sub update_rules {
 		my $score = effective_score($client,$time);
 
 		# also forget those which are neutral
-		delete $clients{$client->{ip}} if $score == 0 && ($time-$client->{last_seen}) > 300;
+		if ($score == 0 && ($time-$client->{last_seen}) > 300) {
+			delete $clients{$client->{ip}};
+			next;
+		}
 
 		# now deny the bad guys
 		push @deny, $client->{ip} if $score > 100 && !defined $filter->{$client->{ip}};
