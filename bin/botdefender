@@ -8,7 +8,7 @@ use File::Spec;
 $|=1;
 
 # finish sudo session when done
-END { print "Logout\n"; system "sudo -K"; }
+END { system "sudo -K"; }
 
 our %clients;
 our %pattern_config;
@@ -48,7 +48,6 @@ Maybe you do not want to decrease score that way at all. (To be investigated.)
 ";
 }
 
-syntax unless @ARGV;
 my ($base,$list,$help,@watch) = File::Spec->rel2abs(($0=~m,(.*)/,)[0])."/../conf";
 GetOptions(
 	"help", \$help,
@@ -56,6 +55,18 @@ GetOptions(
 	"list", \$list,
 	"watch=s", \@watch,
 );
+syntax unless @watch;
+
+if ($list) {
+	opendir DH,$base or die "Cannot list config base directory. Cause: $!";
+	print "Known log types:\n";
+	while (readdir DH) {
+		next unless -f "$base/$_";
+		next unless /^(.+)\.conf$/;
+		print "\t$1\n";
+	}
+	exit;
+}
 
 # not root? have to prepare using sudo
 if ($< != 0) {
@@ -248,7 +259,7 @@ sub update_rules {
 		my $score = effective_score($client,$time);
 
 		# also forget those which are neutral
-		delete $clients{$client->{ip}} if $score == 0;
+		delete $clients{$client->{ip}} if $score == 0 && ($time-$client->{last_seen}) > 300;
 
 		# now deny the bad guys
 		push @deny, $client->{ip} if $score > 100 && !defined $filter->{$client->{ip}};
@@ -273,7 +284,7 @@ sub update_rules {
 
 syntax if $help;
 # scan log(s)
-foreach (@ARGV) {eval {
+foreach (@watch) {eval {
 	my ($type,$log) = /^(.+?):(.+)$/;
 	die "Not a valid type:file combination: $_" unless defined $type;
 	if (! defined($pattern_config{$type}//=read_pattern_config($type))) {
@@ -302,9 +313,10 @@ sub equal($$) {
 }
 
 my $rtime = time();
+die "No logs to watch.\n" unless @logs;
 while (1) {
 	my $mod = 0;
-	foreach my $log (@logs) {eval {
+	foreach my $log (@logs) {
 		my @sf = stat($log->{file});
 		my @sh = stat($log->{fh});
 
@@ -329,7 +341,7 @@ while (1) {
 			$log->{size} = $sh[9];
 			$mod=1;
 		}
-	}}
+	}
 
 	# update banned ips
 	if ($mod || (time > $rtime+30)) {
