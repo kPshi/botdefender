@@ -3,7 +3,6 @@ use strict;
 #use Carp;
 use Date::Parse;
 use Getopt::Long;
-use File::Spec;
 #alarm 86400;
 $|=1;
 
@@ -20,7 +19,8 @@ sub syntax {
 	die "Syntax: $me <options>
 Where options are
 	--help			show this help
-	--base <dir>		base directory to check for pattern definitions
+	--conf <dir>		conf directory to check for pattern definitions, defaults
+				defaults to /etc/botdefender/conf
 	--list			list all known pattern definition types (like apache-access, auth,
 				exim4, ...)
 	--watch <type>:<file>	watch defined file with patterns according to <type>
@@ -48,19 +48,19 @@ Maybe you do not want to decrease score that way at all. (To be investigated.)
 ";
 }
 
-my ($base,$list,$help,@watch) = File::Spec->rel2abs(($0=~m,(.*)/,)[0])."/../conf";
+my ($conf,$list,$help,@watch) = "/etc/botdefender/conf";
 GetOptions(
 	"help", \$help,
-	"base=s", \$base,
+	"conf=s", \$conf,
 	"list", \$list,
 	"watch=s", \@watch,
 );
 
 if ($list) {
-	opendir DH,$base or die "Cannot list config base directory. Cause: $!";
+	opendir DH,$conf or die "Cannot list config directory. Cause: $!";
 	print "Known log types:\n";
 	while (readdir DH) {
-		next unless -f "$base/$_";
+		next unless -f "$conf/$_";
 		next unless /^(.+)\.conf$/;
 		print "\t$1\n";
 	}
@@ -111,7 +111,7 @@ sub parse_val {
 
 sub read_pattern_config {
 	my $type = shift;
-	my $file = "$base/$type.conf";
+	my $file = "$conf/$type.conf";
 	open(my $fh,"<",$file) or die $!;
 	my %conf = (
 		var => {},
