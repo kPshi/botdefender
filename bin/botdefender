@@ -55,7 +55,6 @@ GetOptions(
 	"list", \$list,
 	"watch=s", \@watch,
 );
-syntax unless @watch;
 
 if ($list) {
 	opendir DH,$base or die "Cannot list config base directory. Cause: $!";
@@ -67,6 +66,7 @@ if ($list) {
 	}
 	exit;
 }
+syntax unless @watch;
 
 # not root? have to prepare using sudo
 if ($< != 0) {
@@ -282,7 +282,6 @@ sub update_rules {
 	#system "$iptables_cmd -nvL botdefender";
 }
 
-syntax if $help;
 # scan log(s)
 foreach (@watch) {eval {
 	my ($type,$log) = /^(.+?):(.+)$/;
