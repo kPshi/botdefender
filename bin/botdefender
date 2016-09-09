@@ -3,16 +3,18 @@ use strict;
 #use Carp;
 use Date::Parse;
 use Getopt::Long;
-#alarm 86400;
+use Data::Dumper;
 $|=1;
-
-# finish sudo session when done
-END { system "sudo -K"; }
 
 our %clients;
 our %pattern_config;
 our @logs;
-our @iptables_cmd = "iptables";
+our @iptables_cmd = qw(iptables -w);
+END {
+	# finish sudo session when done
+	system "sudo -K";
+}
+
 # check parameters
 sub syntax {
 	my ($me) = $0=~m,([^/]+)$,;
@@ -24,6 +26,8 @@ Where options are
 	--list			list all known pattern definition types (like apache-access, auth,
 				exim4, ...)
 	--watch <type>:<file>	watch defined file with patterns according to <type>
+	--dryrun		do not perform any action, only show what would be done
+	--verbose		more detailed output
 
 Watches log files for modifications, parses new entries to find patterns to find attackers and bots.
 Each pattern defines a score which is summed up per IP. If an IP gets more than 100 score points
@@ -48,12 +52,14 @@ Maybe you do not want to decrease score that way at all. (To be investigated.)
 ";
 }
 
-my ($conf,$list,$help,@watch) = "/etc/botdefender/conf";
+my ($conf,$list,$help,@watch,$dryrun,$verbose) = "/etc/botdefender/conf";
 GetOptions(
 	"help", \$help,
 	"conf=s", \$conf,
 	"list", \$list,
 	"watch=s", \@watch,
+	"dryrun", \$dryrun,
+	"verbose", \$verbose,
 );
 
 if ($list) {
@@ -72,7 +78,7 @@ syntax unless @watch;
 if ($< != 0) {
 	# try to authenticate and call iptables for testing
 	# TODO: maybe try all iptables commands we use?
-	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ".(getpwuid($<))[0]." to call iptables: ' @iptables_cmd -L botdefender -n > /dev/null";
+	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ".(getpwuid($<))[0]." to call iptables: ' @iptables_cmd -L INPUT -n > /dev/null";
 	# that's how we use iptables now: sudo with no prompt
 	@iptables_cmd = ("sudo","-n",@iptables_cmd);
 	# keep sudo timestamp up to date
@@ -82,8 +88,21 @@ if ($< != 0) {
 	};
 	alarm 1;
 }
+# don't do anything in dryrun
+unshift @iptables_cmd, "echo" if $dryrun;
+
 # first call: start from scratch
-system @iptables_cmd,"-F","botdefender";
+system "@iptables_cmd -D INPUT -j botdefender 2>/dev/null";
+system "@iptables_cmd -F botdefender 2>/dev/null";
+system "@iptables_cmd -X botdefender 2>/dev/null";
+system "@iptables_cmd -N botdefender 2>/dev/null";
+system "@iptables_cmd -I INPUT -j botdefender 2>/dev/null";
+$SIG{INT} = $SIG{TERM} = sub {
+	# drop filters
+	system "@iptables_cmd -D INPUT -j botdefender 2>/dev/null";
+	system "@iptables_cmd -X botdefender 2>/dev/null";
+	exit;
+};
 
 sub max {
 	my $max;
@@ -168,7 +187,10 @@ sub parse_log($) {
 	my $log = shift;
 	my $fh = $log->{fh};
 	my $conf = $pattern_config{$log->{type}};
+	my $any_match = 0;
 	while (my $line = <$fh>) {
+		print $line if $verbose;
+		# fill analysis variables like IP and stuff
 		my %var;
 		foreach my $var (keys %{$conf->{var}}) {
 			my $val = $conf->{var}->{$var};
@@ -182,7 +204,10 @@ sub parse_log($) {
 				$var{$var} = $val;
 			}
 		}
-		defined $var{ip} or next;
+		unless (defined $var{ip}) {
+			print "No IP found. Skip line.\n" if $verbose;
+			next;
+		}
 		my $t = str2time $var{time};
 		$t //= $log->{parse}->{time};
 		$t //= time();
@@ -196,20 +221,30 @@ sub parse_log($) {
 		# decay over time
 		$client->{score} = effective_score($client, $t);
 		$client->{last_seen} = $t;
+		print "Client: ".Dumper($client) if $verbose;
 		
 		# check patterns
 		my $score = 0;
 		foreach my $match (@{$conf->{match}}) {
 			next unless $line =~ /$match->{re}/;
+			print "Matched $match\n" if $verbose;
 			$score=$match->{score};
+			$any_match = 1;
 			last;
 		}
-		$client->{score}=effective_score($client,$t) + $score;
+		#$client->{score}=effective_score($client,$t) + $score;
+		$client->{score}+=$score;
+		print "Scored $score points, thus $client->{score} in total.\n" if $verbose;
 
 		# enable for debug:
-		#push @{$client->{lines}},{score => $score, line => $line};
-		#shift @{$client->{lines}} while @{$client->{lines}} > 10;
+		if ($verbose) {
+			push @{$client->{lines}},{score => $score, line => $line};
+			shift @{$client->{lines}} while @{$client->{lines}} > 10;
+		}
 	}
+
+	# return whether any patterns matched so we can react
+	$any_match;
 }
 sub effective_score {
 	my $client = shift;
@@ -299,7 +334,7 @@ sub update_rules {
 		print localtime()." - clients:\n";
 		print "\t$_->{ip} : ".effective_score($_,$time)."\n" foreach sort {effective_score($a,$time) <=> effective_score($b,$time)} values %clients;
 	}
-	#system "@iptables_cmd -L botdefender -nv";
+	system "@iptables_cmd -L botdefender -nv" if $verbose;
 }
 
 # scan log(s)
@@ -323,7 +358,6 @@ foreach (@watch) {
 
 	open($log->{fh},"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
 	push @logs,$log;
-	
 }
 sub equal($$) {
 	return 1 unless defined $_[0];
@@ -342,7 +376,7 @@ while (1) {
 		# file was re-created
 		if (!equal $sh[1], $sf[1]) {
 			# finish old
-			parse_log $log;
+			($mod=1) if parse_log $log;
 			close ($log->{fh});
 
 			# open new
@@ -355,10 +389,10 @@ while (1) {
 
 		# some changes?
 		if (!equal($sh[7], $log->{mtime}) || !equal($sh[9], $log->{size})) {
-			parse_log $log;
+			($mod=1) if parse_log $log;
 			$log->{mtime} = $sh[7];
 			$log->{size} = $sh[9];
-			$mod=1;
+			#$mod=1;
 		}
 	}
 
@@ -366,6 +400,7 @@ while (1) {
 	if ($mod || (time > $rtime+30)) {
 		update_rules();
 		$rtime = time;
+		print Dumper(\%clients) if $verbose;
 	}
 
 	# wait a while
