@@ -4,7 +4,7 @@ A: Botdefender is simple and flexible tool to lock out the bad guys from your
    for attack/bot patterns and locks out IPs by adding rules into your iptables.
    Your instance is completely self-supporting and does not send our receive anything.
 
-Q: What does it deppend on?
+Q: What does it depend on?
 A: Botdefender needs some logs to parse, iptables for locking addresses out and
    sudo access to iptables if not run as root.
 
