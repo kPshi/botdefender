@@ -9,12 +9,129 @@ our %clients;
 our %pattern_config;
 our @logs;
 our @iptables_cmd = qw(iptables -w);
+
 END {
 	# finish sudo session when done
 	system "sudo -K";
 }
 
-# check parameters
+my ($conf,$list,$help,@watch,$dryrun,$verbose) = "/etc/botdefender/conf";
+GetOptions(
+	"help",    \$help,
+	"conf=s",  \$conf,
+	"list",    \$list,
+	"watch=s", \@watch,
+	"dryrun",  \$dryrun,
+	"verbose", \$verbose,
+);
+
+if ($list) {
+	opendir DH,$conf or die "Cannot list config directory. Cause: $!";
+	print "Known log types:\n";
+	while (readdir DH) {
+		next unless -f "$conf/$_";
+		next unless /^(.+)\.conf$/;
+		print "\t$1\n";
+	}
+	exit;
+}
+syntax() unless @watch;
+
+# not root? have to prepare using sudo
+if ($< != 0) {
+	# TODO: maybe try all iptables commands we use?
+	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ".(getpwuid($<))[0]." to call iptables: ' @iptables_cmd -L INPUT -n > /dev/null";
+	@iptables_cmd = ("sudo","-n",@iptables_cmd);
+	# keep sudo timestamp up to date
+	$SIG{ALRM} = sub {
+		system "sudo -v";
+		alarm 1;
+	};
+	alarm 1;
+}
+# don't do anything in dryrun
+unshift @iptables_cmd, "echo" if $dryrun;
+
+# first call: start from scratch
+system "@iptables_cmd -D INPUT -j botdefender 2>/dev/null";
+system "@iptables_cmd -F botdefender 2>/dev/null";
+system "@iptables_cmd -X botdefender 2>/dev/null";
+system "@iptables_cmd -N botdefender 2>/dev/null";
+system "@iptables_cmd -I INPUT -j botdefender 2>/dev/null";
+$SIG{INT} = $SIG{TERM} = sub {
+	# drop filters
+	system "@iptables_cmd -D INPUT -j botdefender 2>/dev/null";
+	system "@iptables_cmd -X botdefender 2>/dev/null";
+	exit;
+};
+
+foreach (@watch) {
+	my ($type,$log) = /^(.+?):(.+)$/;
+	die "Not a valid type:file combination: $_" unless defined $type;
+	if (! defined($pattern_config{$type}//=read_pattern_config($type))) {
+		die "Unknown type name: $type";
+	}
+	die "File not found: $log"     unless -e $log;
+	die "Not a regular file: $log" unless -f $log;
+	die "Cannot read file: $log"   unless -r $log;
+
+	$log = {
+		file  => $log,
+		mtime => 0,
+		size  => 0,
+		type  => $type,
+	};
+
+	open($log->{fh},"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
+	push @logs,$log;
+}
+die "No logs to watch.\n" unless @logs;
+
+my $SIGHUP = 0;
+$SIG{HUP} = sub { $SIGHUP = 1 };
+
+my $rtime = time();
+while (1) {
+	my $mod = 0;
+	foreach my $log (@logs) {
+		my @sf = stat($log->{file});
+		my @sh = stat($log->{fh});
+
+		# file was re-created
+		if (!equal $sh[1], $sf[1]) {
+			($mod=1) if parse_log $log;
+			close ($log->{fh});
+
+			open($log->{fh},"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
+			$log->{mtime} = 0;
+			$log->{size}  = 0;
+			@sh = @sf;
+			$mod = 1;
+		}
+
+		# some changes?
+		if (!equal($sh[7], $log->{mtime}) || !equal($sh[9], $log->{size})) {
+			($mod=1) if parse_log $log;
+			$log->{mtime} = $sh[7];
+			$log->{size}  = $sh[9];
+		}
+	}
+
+	if ($mod || (time > $rtime+30)) {
+		update_rules();
+		$rtime = time;
+		print Dumper(\%clients) if $verbose;
+	}
+
+	select undef,undef,undef,.1;
+	if ($SIGHUP) {
+		reread_config();
+		$SIGHUP = 0;
+	}
+}
+
+# --- subroutines ---
+
 sub syntax {
 	my ($me) = $0=~m,([^/]+)$,;
 	die "Syntax: $me <options>
@@ -51,66 +168,12 @@ Maybe you do not want to decrease score that way at all. (To be investigated.)
 ";
 }
 
-my ($conf,$list,$help,@watch,$dryrun,$verbose) = "/etc/botdefender/conf";
-GetOptions(
-	"help", \$help,
-	"conf=s", \$conf,
-	"list", \$list,
-	"watch=s", \@watch,
-	"dryrun", \$dryrun,
-	"verbose", \$verbose,
-);
-
-if ($list) {
-	opendir DH,$conf or die "Cannot list config directory. Cause: $!";
-	print "Known log types:\n";
-	while (readdir DH) {
-		next unless -f "$conf/$_";
-		next unless /^(.+)\.conf$/;
-		print "\t$1\n";
-	}
-	exit;
+sub equal {
+	return 1 unless defined $_[0];
+	return 1 unless defined $_[1];
+	$_[0] eq $_[1];
 }
-syntax unless @watch;
 
-# not root? have to prepare using sudo
-if ($< != 0) {
-	# try to authenticate and call iptables for testing
-	# TODO: maybe try all iptables commands we use?
-	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ".(getpwuid($<))[0]." to call iptables: ' @iptables_cmd -L INPUT -n > /dev/null";
-	# that's how we use iptables now: sudo with no prompt
-	@iptables_cmd = ("sudo","-n",@iptables_cmd);
-	# keep sudo timestamp up to date
-	$SIG{ALRM} = sub {
-		system "sudo -v";
-		alarm 1;
-	};
-	alarm 1;
-}
-# don't do anything in dryrun
-unshift @iptables_cmd, "echo" if $dryrun;
-
-# first call: start from scratch
-system "@iptables_cmd -D INPUT -j botdefender 2>/dev/null";
-system "@iptables_cmd -F botdefender 2>/dev/null";
-system "@iptables_cmd -X botdefender 2>/dev/null";
-system "@iptables_cmd -N botdefender 2>/dev/null";
-system "@iptables_cmd -I INPUT -j botdefender 2>/dev/null";
-$SIG{INT} = $SIG{TERM} = sub {
-	# drop filters
-	system "@iptables_cmd -D INPUT -j botdefender 2>/dev/null";
-	system "@iptables_cmd -X botdefender 2>/dev/null";
-	exit;
-};
-
-sub max {
-	my $max;
-	foreach (@_) {
-		next unless defined;
-		$max = $_ unless defined $max && $max > $_;
-	}
-	$max;
-}
 sub parse_val {
 	my $val = shift;
 	if ($val =~ /^m(.)(.+?)\1([a-z]*)$/ or $val =~ m,^(/)(.+?)\1([a-z]*)$,) {
@@ -134,9 +197,9 @@ sub read_pattern_config {
 	my $file = "$conf/$type.conf";
 	open(my $fh,"<",$file) or die $!;
 	my %conf = (
-		var => {},
+		var   => {},
 		match => [],
-		file => $file,
+		file  => $file,
 	);
 	@conf{"size","mtime"} = (stat $fh)[7,9];
 	my $section;
@@ -170,26 +233,21 @@ sub read_pattern_config {
 	}
 	\%conf;
 }
+
 sub reread_config {
 	my @types = keys %pattern_config;
 	foreach my $type (@types) {
 		$pattern_config{$type} = read_pattern_config($type);
 	}
 }
-my $SIGHUP=0;
-$SIG{HUP} = sub {
-	$SIGHUP=1;
-};
 
-# there is some new data in this file handle
 sub parse_log($) {
 	my $log = shift;
-	my $fh = $log->{fh};
+	my $fh   = $log->{fh};
 	my $conf = $pattern_config{$log->{type}};
 	my $any_match = 0;
 	while (my $line = <$fh>) {
 		print $line if $verbose;
-		# fill analysis variables like IP and stuff
 		my %var;
 		foreach my $var (keys %{$conf->{var}}) {
 			my $val = $conf->{var}->{$var};
@@ -221,33 +279,30 @@ sub parse_log($) {
 		$client->{score} = effective_score($client, $t);
 		$client->{last_seen} = $t;
 		print "Client: ".Dumper($client) if $verbose;
-		
-		# check patterns
+
 		my $score = 0;
 		foreach my $match (@{$conf->{match}}) {
 			next unless $line =~ /$match->{re}/;
 			print "Matched $match\n" if $verbose;
-			$score=$match->{score};
+			$score = $match->{score};
 			$any_match = 1;
 			last;
 		}
-		$client->{score}+=$score;
+		$client->{score} += $score;
 		print "Scored $score points, thus $client->{score} in total.\n" if $verbose;
 
-		# enable for debug:
 		if ($verbose) {
 			push @{$client->{lines}},{score => $score, line => $line};
 			shift @{$client->{lines}} while @{$client->{lines}} > 10;
 		}
 	}
-
-	# return whether any patterns matched so we can react
 	$any_match;
 }
+
 sub effective_score {
 	my $client = shift;
-	my $time = shift;
-	my $decay = ($time-$client->{last_seen})/60;
+	my $time   = shift;
+	my $decay  = ($time-$client->{last_seen})/60;
 
 	$client->{score} > 0
 		? $client->{score} > $decay
@@ -257,6 +312,7 @@ sub effective_score {
 			? $client->{score}+$decay
 			: 0
 }
+
 sub get_filter {
 	my %filter;
 	my @fields;
@@ -269,7 +325,6 @@ sub get_filter {
 			foreach my $i (0..$#fields) {
 				$entry->{$fields[$i]} = $v[$i];
 			}
-			# put into lookup-map
 			$filter{$entry->{source}} = $entry;
 		} else {
 			@fields = /(\w+)/g;
@@ -279,24 +334,22 @@ sub get_filter {
 }
 
 sub update_rules {
-	my $time = time();
-	my $line=0;
+	my $time   = time();
 	my $filter = get_filter();
 
 	my @deny;
 	my @allow;
-	my $mod=0;
+	my $mod = 0;
 	foreach my $client (values %clients) {
 		# if packets have been blocked, we saw him:
 		$client->{last_seen} = $time if (($filter->{$client->{ip}})//{})->{pkts};
 
-		# if not forget him after 24 hours (at most)
+		# forget him after 24 hours (at most)
 		if ($client->{last_seen} < ($time-24*3600)) {
 			delete $clients{$client->{ip}};
 			next;
 		}
 
-		# effective score with decay
 		my $score = effective_score($client,$time);
 
 		# also forget those which are neutral
@@ -305,10 +358,8 @@ sub update_rules {
 			next;
 		}
 
-		# now deny the bad guys
-		push @deny, $client->{ip} if $score > 100 && !defined $filter->{$client->{ip}};
-		# and allow those who behave now
-		push @allow, $client->{ip} if $score < 10 && defined $filter->{$client->{ip}};
+		push @deny,  $client->{ip} if $score > 100 && !defined $filter->{$client->{ip}};
+		push @allow, $client->{ip} if $score < 10  &&  defined $filter->{$client->{ip}};
 	}
 
 	# allow those which we don't know anymore
@@ -320,12 +371,12 @@ sub update_rules {
 		for (my $i = 0 ; $i < @allow ; ++$i) {
 			system @iptables_cmd,"-D","botdefender",($allow[$i]->{num}-$i);
 		}
-		$mod=1;
+		$mod = 1;
 	}
 	if (@deny) {
 		print "Deny @deny\n";
 		system @iptables_cmd,"-I","botdefender","--source",$_,"-j","banned" foreach @deny;
-		$mod=1;
+		$mod = 1;
 	}
 	if ($mod) {
 		print localtime()." - clients:\n";
@@ -333,77 +384,3 @@ sub update_rules {
 	}
 	system "@iptables_cmd -L botdefender -nv" if $verbose;
 }
-
-# scan log(s)
-foreach (@watch) {
-	my ($type,$log) = /^(.+?):(.+)$/;
-	die "Not a valid type:file combination: $_" unless defined $type;
-	if (! defined($pattern_config{$type}//=read_pattern_config($type))) {
-		die "Unknown type name: $type";
-		
-	}
-	die "File not found: $log" unless -e $log;
-	die "Not a regular file: $log" unless -f $log;
-	die "Cannot read file: $log" unless -r $log;
-
-	$log = {
-		file => $log,
-		mtime => 0,
-		size => 0,
-		type => $type,
-	};
-
-	open($log->{fh},"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
-	push @logs,$log;
-}
-sub equal($$) {
-	return 1 unless defined $_[0];
-	return 1 unless defined $_[1];
-	$_[0] eq $_[1];
-}
-
-my $rtime = time();
-die "No logs to watch.\n" unless @logs;
-while (1) {
-	my $mod = 0;
-	foreach my $log (@logs) {
-		my @sf = stat($log->{file});
-		my @sh = stat($log->{fh});
-
-		# file was re-created
-		if (!equal $sh[1], $sf[1]) {
-			# finish old
-			($mod=1) if parse_log $log;
-			close ($log->{fh});
-
-			# open new
-			open($log->{fh} ,"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
-			$log->{mtime} = 0;
-			$log->{size} = 0;
-			@sh = @sf;
-			$mod=1;
-		} 
-
-		# some changes?
-		if (!equal($sh[7], $log->{mtime}) || !equal($sh[9], $log->{size})) {
-			($mod=1) if parse_log $log;
-			$log->{mtime} = $sh[7];
-			$log->{size} = $sh[9];
-		}
-	}
-
-	# update banned ips
-	if ($mod || (time > $rtime+30)) {
-		update_rules();
-		$rtime = time;
-		print Dumper(\%clients) if $verbose;
-	}
-
-	# wait a while
-	select undef,undef,undef,.1;
-	if ($SIGHUP) {
-		reread_config();
-		$SIGHUP=0;
-	}
-}
-
