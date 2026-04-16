@@ -1,6 +1,5 @@
 #!/usr/bin/perl -w
 use strict;
-#use Carp;
 use Date::Parse;
 use Getopt::Long;
 use Data::Dumper;
@@ -232,7 +231,6 @@ sub parse_log($) {
 			$any_match = 1;
 			last;
 		}
-		#$client->{score}=effective_score($client,$t) + $score;
 		$client->{score}+=$score;
 		print "Scored $score points, thus $client->{score} in total.\n" if $verbose;
 
@@ -263,7 +261,6 @@ sub get_filter {
 	my %filter;
 	my @fields;
 	foreach (`@iptables_cmd -L botdefender --line-numbers -nv -Z`) {
-		#print;
 		next if /^Chain /;
 		next if /^Zeroing /;
 		if (@fields) {
@@ -392,7 +389,6 @@ while (1) {
 			($mod=1) if parse_log $log;
 			$log->{mtime} = $sh[7];
 			$log->{size} = $sh[9];
-			#$mod=1;
 		}
 	}
 
