@@ -39,8 +39,10 @@ syntax() unless @watch;
 
 # not root? have to prepare using sudo
 if ($< != 0) {
+	# try to authenticate and call iptables for testing
 	# TODO: maybe try all iptables commands we use?
 	die "Cannot invoke iptables" if system "sudo -p '[sudo] password for ".(getpwuid($<))[0]." to call iptables: ' @iptables_cmd -L INPUT -n > /dev/null";
+	# that's how we use iptables now: sudo with no prompt
 	@iptables_cmd = ("sudo","-n",@iptables_cmd);
 	# keep sudo timestamp up to date
 	$SIG{ALRM} = sub {
@@ -65,6 +67,7 @@ $SIG{INT} = $SIG{TERM} = sub {
 	exit;
 };
 
+# scan log(s)
 foreach (@watch) {
 	my ($type,$log) = /^(.+?):(.+)$/;
 	die "Not a valid type:file combination: $_" unless defined $type;
@@ -99,9 +102,11 @@ while (1) {
 
 		# file was re-created
 		if (!equal $sh[1], $sf[1]) {
+			# finish old
 			($mod=1) if parse_log $log;
 			close ($log->{fh});
 
+			# open new
 			open($log->{fh},"<",$log->{file}) or die "Cannot open file: $log->{file} - cause $!";
 			$log->{mtime} = 0;
 			$log->{size}  = 0;
@@ -117,12 +122,14 @@ while (1) {
 		}
 	}
 
+	# update banned ips
 	if ($mod || (time > $rtime+30)) {
 		update_rules();
 		$rtime = time;
 		print Dumper(\%clients) if $verbose;
 	}
 
+	# wait a while
 	select undef,undef,undef,.1;
 	if ($SIGHUP) {
 		reread_config();
@@ -132,6 +139,7 @@ while (1) {
 
 # --- subroutines ---
 
+# check parameters
 sub syntax {
 	my ($me) = $0=~m,([^/]+)$,;
 	die "Syntax: $me <options>
@@ -241,6 +249,7 @@ sub reread_config {
 	}
 }
 
+# there is some new data in this file handle
 sub parse_log($) {
 	my $log = shift;
 	my $fh   = $log->{fh};
@@ -248,6 +257,7 @@ sub parse_log($) {
 	my $any_match = 0;
 	while (my $line = <$fh>) {
 		print $line if $verbose;
+		# fill analysis variables like IP and stuff
 		my %var;
 		foreach my $var (keys %{$conf->{var}}) {
 			my $val = $conf->{var}->{$var};
@@ -280,6 +290,7 @@ sub parse_log($) {
 		$client->{last_seen} = $t;
 		print "Client: ".Dumper($client) if $verbose;
 
+		# check patterns
 		my $score = 0;
 		foreach my $match (@{$conf->{match}}) {
 			next unless $line =~ /$match->{re}/;
@@ -291,11 +302,14 @@ sub parse_log($) {
 		$client->{score} += $score;
 		print "Scored $score points, thus $client->{score} in total.\n" if $verbose;
 
+		# enable for debug:
 		if ($verbose) {
 			push @{$client->{lines}},{score => $score, line => $line};
 			shift @{$client->{lines}} while @{$client->{lines}} > 10;
 		}
 	}
+
+	# return whether any patterns matched so we can react
 	$any_match;
 }
 
@@ -325,6 +339,7 @@ sub get_filter {
 			foreach my $i (0..$#fields) {
 				$entry->{$fields[$i]} = $v[$i];
 			}
+			# put into lookup-map
 			$filter{$entry->{source}} = $entry;
 		} else {
 			@fields = /(\w+)/g;
@@ -344,12 +359,13 @@ sub update_rules {
 		# if packets have been blocked, we saw him:
 		$client->{last_seen} = $time if (($filter->{$client->{ip}})//{})->{pkts};
 
-		# forget him after 24 hours (at most)
+		# if not forget him after 24 hours (at most)
 		if ($client->{last_seen} < ($time-24*3600)) {
 			delete $clients{$client->{ip}};
 			next;
 		}
 
+		# effective score with decay
 		my $score = effective_score($client,$time);
 
 		# also forget those which are neutral
@@ -358,7 +374,9 @@ sub update_rules {
 			next;
 		}
 
+		# now deny the bad guys
 		push @deny,  $client->{ip} if $score > 100 && !defined $filter->{$client->{ip}};
+		# and allow those who behave now
 		push @allow, $client->{ip} if $score < 10  &&  defined $filter->{$client->{ip}};
 	}
 
