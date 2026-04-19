@@ -2,7 +2,7 @@ Q: What is Botdefender?
 A: Botdefender is simple and flexible tool to lock out the bad guys from your
    host. It waits on changes in log files (similar to tail -f), scans new entries
    for attack/bot patterns and locks out IPs by adding rules into your iptables.
-   Your instance is completely self-supporting and does not send our receive anything.
+   Your instance is completely self-supporting and does not send or receive anything.
 
 Q: What does it depend on?
 A: Botdefender needs some logs to parse, iptables for locking addresses out and
